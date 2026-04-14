@@ -1,6 +1,18 @@
 # Portfolio-3d
 Visualización 3D animada del espacio de optimización de portafolios. Renderiza una superficie de Sharpe Ratio en tiempo real sobre todas las combinaciones posibles de pesos, mostrando cómo se desplaza el portafolio óptimo cuando cambian las condiciones del mercado. Construido con Python, NumPy y Matplotlib.
+---
 
+## 📖 Documentación Completa
+
+Para una explicación detallada del proyecto incluyendo:
+- 🧮 Fundamentos matemáticos
+- 🏗️ Arquitectura del código
+- 📊 Visualizaciones e interpretación
+- 💡 Casos de uso en finanzas cuantitativas
+
+👉 **[Ver documentación completa en Notion](https://www.notion.so/3D-Portfolio-Optimization-Landscape-31e7f18e4ca280a8a442ceb5d69b8cbc?source=copy_link)**
+
+---
 ## ▶️ Cómo copiar y ejecutar
 
 1. **Haz fork de este repositorio** en GitHub o copia y pega a tu máquina local.
