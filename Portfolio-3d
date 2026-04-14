@@ -1,0 +1,327 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import RadioButtons
+import yfinance as yf
+import pandas as pd
+import datetime
+
+# =====================
+# CONFIGURACIÓN
+# =====================
+GROUPS = {
+    "Grupo 1 — Tech US": {
+        "tickers": ["^NDX", "MSFT", "ADBE"],
+        "labels":  ["Nasdaq 100", "Microsoft", "Adobe"],
+        "colors":  ["#00FFF7", "#8F5AFF", "#FF6EC7"]
+    },
+    "Grupo 2 — Latam & Semi": {
+        "tickers": ["^SOX", "MELI", "EC"],
+        "labels":  ["SOX Semis", "MercadoLibre", "Ecopetrol"],
+        "colors":  ["#FFD700", "#00FF99", "#FF6600"]
+    }
+}
+
+RF_RATE      = 0.02
+GRID_SIZE    = 45
+N_FRAMES     = 200
+INTERVAL_MS  = 80
+LOOKBACK_WIN = 60
+START_DATE   = "2020-01-01"
+END_DATE     = datetime.date.today().strftime("%Y-%m-%d")
+CAPITAL      = 1000.0
+
+# =====================
+# DATOS
+# =====================
+def download_data(tickers):
+    print(f"\n📡 Descargando: {tickers}")
+    raw = yf.download(tickers, start=START_DATE, end=END_DATE, auto_adjust=True, progress=True)
+    prices = raw["Close"] if hasattr(raw.columns, 'levels') else raw
+    prices = prices.dropna()
+    print(f"✅ {len(prices)} días ({START_DATE} → {END_DATE})")
+    return prices
+
+def compute_rolling_stats(prices):
+    log_ret = np.log(prices / prices.shift(1)).dropna()
+    means   = log_ret.rolling(LOOKBACK_WIN).mean().dropna() * 252
+    covs    = log_ret.rolling(LOOKBACK_WIN).cov().dropna() * 252
+    return log_ret, means, covs
+
+def compute_equity(log_ret, weights_df):
+    aligned  = log_ret.loc[weights_df.index]
+    port_ret = (aligned * weights_df).sum(axis=1)
+    return CAPITAL * np.exp(port_ret.cumsum())
+
+def compute_max_dd(equity):
+    dd = (equity - equity.cummax()) / equity.cummax()
+    return dd.min() * 100
+
+def compute_ytd(equity):
+    y = datetime.date.today().year
+    yd = equity[equity.index.year == y]
+    return (yd.iloc[-1] / yd.iloc[0] - 1) * 100 if len(yd) >= 2 else None
+
+# =====================
+# COLORMAP
+# =====================
+def get_cmap():
+    return LinearSegmentedColormap.from_list(
+        "qg", [(0, "#7B1FA2"), (0.5, "#8F5AFF"), (1, "#00FFF7")], N=256
+    )
+
+# =====================
+# PAISAJE
+# =====================
+def generate_landscape(means_vec, cov_matrix):
+    w  = np.linspace(0, 1, GRID_SIZE)
+    W1, W2 = np.meshgrid(w, w)
+    W3   = 1 - W1 - W2
+    mask = (W3 >= 0) & (W3 <= 1)
+    mu, S = means_vec, cov_matrix
+
+    ret = W1*mu[0] + W2*mu[1] + W3*mu[2]
+    var = (W1**2*S[0,0] + W2**2*S[1,1] + W3**2*S[2,2]
+           + 2*W1*W2*S[0,1] + 2*W1*W3*S[0,2] + 2*W2*W3*S[1,2])
+    std    = np.sqrt(np.maximum(var, 1e-10))
+    sharpe = (ret - RF_RATE) / std
+    sharpe[~mask] = np.nan
+
+    idx = np.nanargmax(sharpe)
+    ow1, ow2 = W1.flat[idx], W2.flat[idx]
+    ow3 = 1 - ow1 - ow2
+    osr = sharpe.flat[idx]
+
+    zmin, zmax = np.nanmin(sharpe), np.nanmax(sharpe)
+    zpad = (zmax - zmin) * 0.30
+    return W1, W2, sharpe, (ow1, ow2, ow3, osr), (zmin - zpad, zmax + zpad)
+
+# =====================
+# VISUALIZADOR
+# =====================
+class PortfolioVisualizer:
+    def __init__(self):
+        self.current_group  = list(GROUPS.keys())[0]
+        self.pending_group  = None          # grupo solicitado por el usuario
+        self.frame_idx      = 0             # frame lógico manejado internamente
+        self.data_cache     = {}
+        self.anim           = None          # referencia fuerte a la animación
+
+        self._preload_data()
+        self._build_ui()
+
+    # ── Precarga ──────────────────────────────────────────────
+    def _preload_data(self):
+        for gname, ginfo in GROUPS.items():
+            prices = download_data(ginfo["tickers"])
+            log_ret, means, covs = compute_rolling_stats(prices)
+            tickers = ginfo["tickers"]
+            dates   = means.index
+
+            rows = []
+            for d in dates:
+                try:
+                    mv  = means.loc[d].values
+                    cm_ = covs.loc[d].loc[tickers, tickers].values
+                    _, _, _, (w1, w2, w3, _), _ = generate_landscape(mv, cm_)
+                    rows.append([w1, w2, w3])
+                except Exception:
+                    rows.append([1/3, 1/3, 1/3])
+
+            wdf    = pd.DataFrame(rows, index=dates, columns=tickers)
+            equity = compute_equity(log_ret, wdf)
+
+            self.data_cache[gname] = {
+                "log_ret":   log_ret,
+                "means":     means,
+                "covs":      covs,
+                "dates":     dates,
+                "equity":    equity,
+                "max_dd":    compute_max_dd(equity),
+                "ytd":       compute_ytd(equity),
+                "final_val": equity.iloc[-1],
+            }
+
+    # ── UI ────────────────────────────────────────────────────
+    def _build_ui(self):
+        plt.style.use('dark_background')
+        self.fig = plt.figure(figsize=(16, 8), facecolor='#0D0D0D')
+        self.fig.suptitle(
+            "3D Portfolio Optimization Landscape  |  Datos Reales 2020 → Hoy",
+            color='#00FFF7', fontsize=14, fontweight='bold', y=0.99
+        )
+
+        gs = gridspec.GridSpec(
+            1, 2, width_ratios=[2.6, 1.4],
+            left=0.01, right=0.97, top=0.93, bottom=0.05, wspace=0.04
+        )
+
+        # Gráfico 3D
+        self.ax = self.fig.add_subplot(gs[0], projection='3d')
+        self.ax.dist = 13
+        self.ax.set_box_aspect([1, 1, 0.55])
+        self._style_3d()
+
+        # Panel base invisible
+        self.fig.add_subplot(gs[1]).set_visible(False)
+
+        # Radio buttons
+        ax_radio = self.fig.add_axes([0.73, 0.74, 0.24, 0.17], facecolor='#1A1A2E')
+        self.radio = RadioButtons(ax_radio, list(GROUPS.keys()), activecolor='#00FFF7')
+        for lbl in self.radio.labels:
+            lbl.set_color('white')
+            lbl.set_fontsize(8.5)
+        ax_radio.set_title("Seleccionar Grupo", color='#00FFF7', fontsize=9, pad=5)
+        self.radio.on_clicked(self._request_group_change)   # ← solo registra el cambio
+
+        # Panel pesos
+        self.ax_w = self.fig.add_axes([0.73, 0.43, 0.24, 0.28], facecolor='#111122')
+        self.ax_w.set_xticks([]); self.ax_w.set_yticks([])
+        for sp in self.ax_w.spines.values(): sp.set_edgecolor('#00FFF7')
+        self.ax_w.set_title("Portafolio Óptimo", color='#00FFF7', fontsize=9)
+        self.txt_w = self.ax_w.text(
+            0.5, 0.5, "Cargando...", transform=self.ax_w.transAxes,
+            color='#00FFF7', fontsize=8.5, ha='center', va='center', fontfamily='monospace'
+        )
+
+        # Panel métricas
+        self.ax_m = self.fig.add_axes([0.73, 0.05, 0.24, 0.35], facecolor='#0D1117')
+        self.ax_m.set_xticks([]); self.ax_m.set_yticks([])
+        for sp in self.ax_m.spines.values(): sp.set_edgecolor('#FFD700')
+        self.ax_m.set_title("💰 Métricas  ($1,000 invertidos)", color='#FFD700', fontsize=9)
+        self.txt_m = self.ax_m.text(
+            0.5, 0.5, "Cargando...", transform=self.ax_m.transAxes,
+            color='#FFD700', fontsize=8.5, ha='center', va='center', fontfamily='monospace'
+        )
+
+        # Una sola animación permanente — nunca se destruye
+        self.anim = FuncAnimation(
+            self.fig, self._update,
+            frames=self._frame_gen,   # generador infinito
+            interval=INTERVAL_MS, blit=False, cache_frame_data=False
+        )
+
+    # ── Generador infinito de frames ──────────────────────────
+    def _frame_gen(self):
+        """Genera frames 0..N_FRAMES-1 en loop; al detectar cambio de grupo reinicia."""
+        frame = 0
+        while True:
+            # Aplicar cambio de grupo si fue solicitado
+            if self.pending_group is not None:
+                self.current_group = self.pending_group
+                self.pending_group = None
+                frame = 0
+            yield frame
+            frame = (frame + 1) % N_FRAMES
+
+    # ── Callback del radio button (solo registra) ──────────────
+    def _request_group_change(self, label):
+        self.pending_group = label   # el cambio real ocurre en _frame_gen
+
+    # ── Estilos 3D ────────────────────────────────────────────
+    def _style_3d(self):
+        self.ax.set_facecolor('#0D0D0D')
+        self.ax.grid(False)
+        for axis in [self.ax.xaxis, self.ax.yaxis, self.ax.zaxis]:
+            axis._axinfo['grid']['color'] = (1, 1, 1, 0.05)
+            axis.pane.fill = False
+            axis.pane.set_edgecolor('#1A1A2E')
+        self.ax.tick_params(colors='#555555', labelsize=7)
+
+    # ── Update principal ──────────────────────────────────────
+    def _update(self, frame):
+        ginfo   = GROUPS[self.current_group]
+        cache   = self.data_cache[self.current_group]
+        labels  = ginfo["labels"]
+        colors  = ginfo["colors"]
+        tickers = ginfo["tickers"]
+
+        n   = len(cache["dates"])
+        idx = int((frame / N_FRAMES) * (n - 1))
+        dt  = cache["dates"][idx].strftime("%Y-%m-%d")
+
+        mv = cache["means"].iloc[idx].values
+        try:
+            cm_ = cache["covs"].loc[cache["dates"][idx]].loc[tickers, tickers].values
+        except Exception:
+            cm_ = np.eye(3) * 0.04
+
+        W1, W2, sharpe, (ow1, ow2, ow3, osr), (zlo, zhi) = generate_landscape(mv, cm_)
+
+        # ── Superficie ──
+        self.ax.clear()
+        self.ax.dist = 13
+        self.ax.set_box_aspect([1, 1, 0.55])
+        self._style_3d()
+
+        self.ax.plot_surface(
+            W1, W2, sharpe, cmap=get_cmap(),
+            edgecolor='none', linewidth=0,
+            antialiased=True, alpha=0.85, rstride=1, cstride=1
+        )
+        self.ax.plot_wireframe(W1, W2, sharpe, color='white', linewidth=0.15, alpha=0.08)
+        self.ax.scatter(ow1, ow2, osr, color='#00FFF7', s=130,
+                        edgecolor='white', linewidth=2, zorder=10)
+        self.ax.plot([ow1, ow1], [ow2, ow2], [zlo, osr],
+                     color='#00FFF7', linewidth=0.9, alpha=0.35, linestyle='--')
+
+        self.ax.set_zlim(zlo, zhi)
+        self.ax.set_xlim(-0.05, 1.05)
+        self.ax.set_ylim(-0.05, 1.05)
+        self.ax.set_xlabel(f'W: {labels[0]}', color=colors[0], fontsize=8, labelpad=12)
+        self.ax.set_ylabel(f'W: {labels[1]}', color=colors[1], fontsize=8, labelpad=12)
+        self.ax.set_zlabel('Sharpe Ratio',    color='#AAAAAA',  fontsize=8, labelpad=12)
+        self.ax.set_title(f"{self.current_group}  |  📅 {dt}",
+                          color='#00FFF7', fontsize=11, pad=18)
+
+        # ── Pesos ──
+        ret_est = (mv[0]*ow1 + mv[1]*ow2 + mv[2]*ow3) * 100
+        self.txt_w.set_text(
+            f"{'─'*24}\n"
+            f"{'Activo':<15}{'Peso':>7}\n"
+            f"{'─'*24}\n"
+            f"{labels[0]:<15}{ow1*100:>6.1f}%\n"
+            f"{labels[1]:<15}{ow2*100:>6.1f}%\n"
+            f"{labels[2]:<15}{ow3*100:>6.1f}%\n"
+            f"{'─'*24}\n"
+            f"Sharpe:   {osr:>8.3f}\n"
+            f"Ret. Est: {ret_est:>7.1f}%"
+        )
+
+        # ── Métricas ──
+        equity = cache["equity"]
+        try:
+            eq_now = equity.loc[:cache["dates"][idx]].iloc[-1]
+        except Exception:
+            eq_now = cache["final_val"]
+
+        pnl_now   = eq_now - CAPITAL
+        pnl_fin   = cache["final_val"] - CAPITAL
+        ytd_str   = f"{cache['ytd']:+.1f}%" if cache["ytd"] is not None else "N/D"
+        s = lambda v: "+" if v >= 0 else ""
+
+        self.txt_m.set_text(
+            f"Capital inicial:  ${CAPITAL:,.0f}\n"
+            f"{'─'*26}\n"
+            f"Valor en {dt[:7]}:\n"
+            f"  ${eq_now:>9,.2f}\n"
+            f"  P&L: {s(pnl_now)}${pnl_now:,.2f}\n"
+            f"{'─'*26}\n"
+            f"Valor final (hoy):\n"
+            f"  ${cache['final_val']:>9,.2f}\n"
+            f"  P&L: {s(pnl_fin)}${pnl_fin:,.2f}\n"
+            f"{'─'*26}\n"
+            f"Max Drawdown:  {cache['max_dd']:.2f}%\n"
+            f"Retorno {datetime.date.today().year}: {ytd_str}"
+        )
+
+        return []
+
+# =====================
+# MAIN
+# =====================
+if __name__ == "__main__":
+    viz = PortfolioVisualizer()
+    plt.show()
